@@ -3,7 +3,7 @@ web_searcher.py — 제품명/Cat.No.로 제조사 사이트를 검색하여 빈
 
 흐름:
   1. 빈 필드가 있는 레코드 감지
-  2. Cat.No. → 제조사 URL 직접 접근 (Thermo Fisher, Sigma-Aldrich 등)
+  2. Cat.No. → 제조사 URL 직접 접근 (Thermo Fisher, Sigma-Aldrich 등) — 병렬
   3. 크롤링 실패 시 DuckDuckGo 검색으로 대체
   4. Gemini AI로 빈 필드 파싱
   5. 원본 레코드에 병합
@@ -13,7 +13,9 @@ import os
 import time
 import json
 import re
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google import genai
@@ -22,8 +24,9 @@ from google.genai import types
 load_dotenv()
 
 MAX_PAGE_CHARS = 4000
-REQUEST_TIMEOUT = 10
-SEARCH_DELAY = 1.5
+REQUEST_TIMEOUT = 5       # 10 → 5초로 단축
+SEARCH_DELAY = 0.5        # 1.5 → 0.5초로 단축
+MAX_WORKERS = 5           # 동시 처리 제품 수
 
 HEADERS = {
     "User-Agent": (
@@ -33,21 +36,18 @@ HEADERS = {
     )
 }
 
-# 채우기 대상에서 제외할 필드
 SKIP_FIELDS = {"No.", "주문일자", "입고일자", "용도", "Lot No.", "위치", "비고"}
 
-# Cat.No. 패턴 → 제조사 직접 URL 템플릿
 VENDOR_URL_TEMPLATES = [
-    # Thermo Fisher / Invitrogen / Gibco / Ambion
     ("https://www.thermofisher.com/order/catalog/product/{cat}", None),
-    # Sigma-Aldrich / Merck
     ("https://www.sigmaaldrich.com/KR/ko/product/sigma/{cat_lower}", None),
     ("https://www.sigmaaldrich.com/KR/ko/product/aldrich/{cat_lower}", None),
-    # Abcam
     ("https://www.abcam.com/products/{cat_lower}", None),
-    # Bio-Rad
     ("https://www.bio-rad.com/en-kr/sku/{cat}", None),
 ]
+
+# Gemini API 동시 호출 제한용 세마포어 (분당 15회 대비)
+_ai_semaphore = threading.Semaphore(3)
 
 
 def _needs_fill(record: dict, columns: list[str]) -> list[str]:
@@ -73,17 +73,35 @@ def _fetch_text(url: str) -> str:
         return ""
 
 
+def _fetch_vendor_url(url: str) -> tuple[str, str]:
+    """단일 벤더 URL 크롤링. (텍스트, url) 반환"""
+    text = _fetch_text(url)
+    if len(text) > 200:
+        return f"[출처: {url}]\n{text}", url
+    return "", ""
+
+
 def _search_vendor_direct(cat_no: str) -> tuple[str, str]:
-    """Cat.No.로 제조사 URL 직접 시도. (웹텍스트, 사용된URL) 반환"""
+    """Cat.No.로 제조사 URL들을 병렬로 시도. (웹텍스트, 사용된URL) 반환"""
     if not cat_no:
         return "", ""
     cat_clean = cat_no.strip().replace(" ", "")
-    for template, _ in VENDOR_URL_TEMPLATES:
-        url = template.format(cat=cat_clean, cat_lower=cat_clean.lower())
-        text = _fetch_text(url)
-        if len(text) > 200:
-            return f"[출처: {url}]\n{text}", url
-        time.sleep(0.3)
+    urls = [
+        template.format(cat=cat_clean, cat_lower=cat_clean.lower())
+        for template, _ in VENDOR_URL_TEMPLATES
+    ]
+
+    # 벤더 URL을 병렬로 동시 요청
+    with ThreadPoolExecutor(max_workers=len(urls)) as executor:
+        futures = {executor.submit(_fetch_vendor_url, url): url for url in urls}
+        for future in as_completed(futures):
+            text, url = future.result()
+            if text:
+                # 첫 번째 성공 결과 즉시 반환, 나머지 취소
+                for f in futures:
+                    f.cancel()
+                return text, url
+
     return "", ""
 
 
@@ -92,33 +110,46 @@ def _search_duckduckgo(query: str) -> tuple[str, str]:
     try:
         from ddgs import DDGS
         results = DDGS().text(query, max_results=3)
+        if not results:
+            return "", ""
+
         combined = ""
         first_url = ""
-        for r in (results or []):
+
+        # 검색 결과 snippet 먼저 모으기
+        urls_to_crawl = []
+        for r in results:
             url = r.get("href", "")
             body = r.get("body", "")
             if body:
                 combined += f"[출처: {url}]\n{body[:500]}\n"
                 if not first_url:
                     first_url = url
-            page_text = _fetch_text(url)
-            if page_text:
-                combined += page_text + "\n"
-            if len(combined) > MAX_PAGE_CHARS:
-                break
-            time.sleep(SEARCH_DELAY)
+            if url:
+                urls_to_crawl.append(url)
+
+        # 페이지 본문을 병렬 크롤링
+        with ThreadPoolExecutor(max_workers=len(urls_to_crawl)) as executor:
+            futures = {executor.submit(_fetch_text, url): url for url in urls_to_crawl}
+            for future in as_completed(futures):
+                page_text = future.result()
+                if page_text:
+                    combined += page_text + "\n"
+                if len(combined) > MAX_PAGE_CHARS:
+                    break
+
+        time.sleep(SEARCH_DELAY)
         return combined[:MAX_PAGE_CHARS], first_url
     except Exception:
         return "", ""
 
 
 def _fill_with_ai(record: dict, empty_fields: list[str], web_text: str, model: str) -> dict:
-    """AI로 빈 필드 채우기"""
+    """AI로 빈 필드 채우기 (세마포어로 동시 호출 제한)"""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or not web_text.strip():
         return {}
 
-    client = genai.Client(api_key=api_key)
     fields_str = ", ".join(f'"{f}"' for f in empty_fields)
     product_info = json.dumps(
         {k: v for k, v in record.items() if v}, ensure_ascii=False
@@ -152,35 +183,83 @@ def _fill_with_ai(record: dict, empty_fields: list[str], web_text: str, model: s
 {{"브랜드": "Thermo Fisher", "입고단위": "500ml", "보관 온도": "4°C"}}
 """
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                max_output_tokens=512,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
-        )
-        text = response.text.strip()
-        text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
-        result = json.loads(text)
-        if isinstance(result, dict):
-            return result
-    except Exception:
-        pass
+    with _ai_semaphore:
+        try:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    max_output_tokens=512,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            text = response.text.strip()
+            text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+            result = json.loads(text)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
     return {}
+
+
+def _enrich_single(
+    idx: int,
+    record: dict,
+    columns: list[str],
+    model: str,
+) -> tuple[int, dict, int, str]:
+    """단일 레코드 보완 (스레드에서 실행). (원본인덱스, 결과레코드, 채운수, 메시지) 반환"""
+    empty_fields = _needs_fill(record, columns)
+    product_name = record.get("제품명", "")
+    cat_no = record.get("Cat. No.", "")
+
+    if not empty_fields:
+        return idx, record, 0, f"빈 필드 없음"
+
+    # 1순위: Cat.No.로 제조사 URL 병렬 접근
+    web_text, source_url = "", ""
+    if cat_no:
+        web_text, source_url = _search_vendor_direct(cat_no)
+
+    # 2순위: DuckDuckGo 검색
+    if not web_text:
+        query = f"{product_name} {cat_no} specification datasheet".strip()
+        web_text, source_url = _search_duckduckgo(query)
+
+    # AI로 빈 필드 채우기
+    filled = {}
+    if web_text:
+        filled = _fill_with_ai(record, empty_fields, web_text, model)
+
+    # 병합
+    new_record = dict(record)
+    filled_count = 0
+    for field, value in filled.items():
+        if field in columns and not new_record.get(field) and value:
+            new_record[field] = value
+            filled_count += 1
+
+    # 비고에 출처 URL 추가
+    if filled_count > 0 and source_url and "비고" in columns:
+        existing = new_record.get("비고") or ""
+        source_note = f"[웹검색출처] {source_url}"
+        new_record["비고"] = f"{existing} | {source_note}".strip(" |") if existing else source_note
+
+    msg = f"{filled_count}개 필드 보완" if web_text else "검색 결과 없음"
+    return idx, new_record, filled_count, msg
 
 
 def enrich_records(
     records: list[dict],
     columns: list[str],
-    model: str = "gemini-2.5-flash",
+    model: str = "gemini-3-flash-preview",
     progress_callback=None,
 ) -> list[dict]:
     """
-    빈 필드가 있는 레코드에 대해 웹 검색으로 정보 보완.
+    빈 필드가 있는 레코드에 대해 웹 검색으로 정보 보완 (병렬 처리).
 
     Args:
         records: AI가 추출한 레코드 리스트
@@ -189,63 +268,36 @@ def enrich_records(
         progress_callback: (current, total, message) 콜백 (UI 진행 표시용)
 
     Returns:
-        보완된 레코드 리스트
+        보완된 레코드 리스트 (순서 유지)
     """
-    enriched = []
     total = len(records)
+    results = [None] * total
+    completed = 0
+    lock = threading.Lock()
 
-    for i, record in enumerate(records):
-        empty_fields = _needs_fill(record, columns)
-        product_name = record.get("제품명", "")
-        cat_no = record.get("Cat. No.", "")
-
-        if not empty_fields:
-            enriched.append(record)
-            if progress_callback:
-                progress_callback(i + 1, total, f"[{i+1}/{total}] {product_name[:30]} - 빈 필드 없음")
-            continue
-
+    def on_done(future):
+        nonlocal completed
+        idx, new_record, _, msg = future.result()
+        results[idx] = new_record
+        product_name = records[idx].get("제품명", "")
+        with lock:
+            completed += 1
+            cur = completed
         if progress_callback:
-            progress_callback(i + 1, total, f"[{i+1}/{total}] {product_name[:30]} 검색 중...")
+            progress_callback(cur, total, f"[{cur}/{total}] {product_name[:30]} - {msg}")
 
-        # 1순위: Cat.No.로 제조사 URL 직접 접근
-        web_text, source_url = "", ""
-        if cat_no:
-            web_text, source_url = _search_vendor_direct(cat_no)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = []
+        for i, record in enumerate(records):
+            f = executor.submit(_enrich_single, i, record, columns, model)
+            f.add_done_callback(on_done)
+            futures.append(f)
 
-        # 2순위: DuckDuckGo 검색
-        if not web_text:
-            query = f"{product_name} {cat_no} specification datasheet".strip()
-            web_text, source_url = _search_duckduckgo(query)
+        # 모든 작업 완료 대기
+        for f in futures:
+            f.result()
 
-        # AI로 빈 필드 채우기
-        filled = {}
-        if web_text:
-            filled = _fill_with_ai(record, empty_fields, web_text, model)
-
-        # 원본에 병합 (기존 값 덮어쓰지 않음)
-        new_record = dict(record)
-        filled_count = 0
-        for field, value in filled.items():
-            if field in columns and not new_record.get(field) and value:
-                new_record[field] = value
-                filled_count += 1
-
-        # 비고에 출처 URL 추가 (웹 검색으로 채운 경우)
-        if filled_count > 0 and source_url and "비고" in columns:
-            existing = new_record.get("비고") or ""
-            source_note = f"[웹검색출처] {source_url}"
-            new_record["비고"] = f"{existing} | {source_note}".strip(" |") if existing else source_note
-
-        enriched.append(new_record)
-
-        if progress_callback:
-            msg = f"[{i+1}/{total}] {product_name[:30]} - {filled_count}개 필드 보완"
-            if not web_text:
-                msg += " (검색 결과 없음)"
-            progress_callback(i + 1, total, msg)
-
-    return enriched
+    return results
 
 
 if __name__ == "__main__":
@@ -255,29 +307,28 @@ if __name__ == "__main__":
 
     config = load_config()
     columns = config["columns"]
-    model = config.get("ai_model", "gemini-2.5-flash")
+    model = config.get("ai_model", "gemini-3-flash-preview")
 
     test_records = [
         {
-            "No.": 1,
-            "주문일자": "2026-02-24",
-            "입고일자": None,
-            "대리점": "지앤바이오",
-            "용도": None,
-            "제품명": "Nuclease-Free Water (not DEPC-Treated)",
-            "Cat. No.": "AM9932",
-            "브랜드": None,
-            "수량": 4,
-            "입고단위": None,
-            "Lot No.": None,
-            "보관 온도": None,
-            "위치": None,
-            "비고": None,
-        }
+            "No.": 1, "주문일자": "2026-02-24", "입고일자": None, "대리점": "지앤바이오",
+            "용도": None, "제품명": "Nuclease-Free Water (not DEPC-Treated)",
+            "Cat. No.": "AM9932", "브랜드": None, "수량": 4, "입고단위": None,
+            "Lot No.": None, "보관 온도": None, "위치": None, "비고": None,
+        },
+        {
+            "No.": 2, "주문일자": "2026-02-24", "입고일자": None, "대리점": "지앤바이오",
+            "용도": None, "제품명": "HEPES (1M)", "Cat. No.": "15630080",
+            "브랜드": None, "수량": 1, "입고단위": None,
+            "Lot No.": None, "보관 온도": None, "위치": None, "비고": None,
+        },
     ]
 
     def cb(cur, tot, msg):
         print(msg)
 
+    import time as _time
+    start = _time.time()
     result = enrich_records(test_records, columns, model, progress_callback=cb)
+    print(f"\n소요시간: {_time.time() - start:.1f}초")
     print(json.dumps(result, ensure_ascii=False, indent=2))
