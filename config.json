@@ -22,5 +22,5 @@
     "비고"
   ],
   "date_field": true,
-  "ai_model": "gemini-2.5-flash"
+  "ai_model": "gemini-3-flash-preview"
 }
