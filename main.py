@@ -19,6 +19,7 @@ from pathlib import Path
 from pdf_reader import extract_for_ai
 from ai_analyzer import analyze_pdf_text
 from csv_writer import save_to_csv, save_to_excel, load_config
+from web_searcher import enrich_records
 
 
 def parse_args():
@@ -28,10 +29,11 @@ def parse_args():
     parser.add_argument("--csv-only", action="store_true", help="CSV만 출력")
     parser.add_argument("--excel-only", action="store_true", help="Excel만 출력")
     parser.add_argument("--out", default=None, help="출력 파일 경로 (확장자 제외)")
+    parser.add_argument("--no-enrich", action="store_true", help="웹 검색 보완 건너뛰기")
     return parser.parse_args()
 
 
-def run(pdf_path: str, append: bool = False, csv_only: bool = False, excel_only: bool = False, out: str = None):
+def run(pdf_path: str, append: bool = False, csv_only: bool = False, excel_only: bool = False, out: str = None, web_enrich: bool = True):
     config = load_config()
     columns = config["columns"]
     model = config.get("ai_model", "gemini-2.5-flash")
@@ -45,12 +47,21 @@ def run(pdf_path: str, append: bool = False, csv_only: bool = False, excel_only:
     extracted = extract_for_ai(pdf_path)
 
     # 2단계: AI 분석
-    print(f"[2/3] AI 분석 중 (모델: {model})...")
+    print(f"[2/4] AI 분석 중 (모델: {model})...")
     records = analyze_pdf_text(extracted, columns, model)
     print(f"      → {len(records)}개 제품 추출 완료")
 
-    # 3단계: 파일 저장
-    print(f"[3/3] 파일 저장 중...")
+    # 3단계: 웹 검색으로 빈 필드 보완
+    if web_enrich:
+        print(f"[3/4] 웹 검색으로 빈 필드 보완 중...")
+        def cb(cur, tot, msg):
+            print(f"      {msg}")
+        records = enrich_records(records, columns, model, progress_callback=cb)
+    else:
+        print(f"[3/4] 웹 검색 건너뜀 (--no-enrich)")
+
+    # 4단계: 파일 저장
+    print(f"[4/4] 파일 저장 중...")
     saved = []
     if not excel_only:
         path = save_to_csv(records, columns, f"{base_out}.csv", append=append)
@@ -74,4 +85,5 @@ if __name__ == "__main__":
         csv_only=args.csv_only,
         excel_only=args.excel_only,
         out=args.out,
+        web_enrich=not args.no_enrich,
     )

@@ -9,6 +9,7 @@ import streamlit as st
 from pdf_reader import extract_for_ai
 from ai_analyzer import analyze_pdf_text
 from csv_writer import load_config
+from web_searcher import enrich_records
 
 # ── 페이지 설정 ──────────────────────────────────────────────
 st.set_page_config(
@@ -40,6 +41,12 @@ uploaded_file = st.file_uploader(
     help="한국어 견적서 PDF를 업로드해주세요.",
 )
 
+web_enrich = st.toggle(
+    "🌐 웹 검색으로 빈 필드 자동 보완",
+    value=True,
+    help="추출 후 빈 항목(브랜드, 입고단위 등)을 웹 검색으로 자동으로 채웁니다. 제품당 2~3초 추가 소요.",
+)
+
 if uploaded_file:
     st.success(f"✅ 파일 업로드 완료: **{uploaded_file.name}**")
 
@@ -58,6 +65,21 @@ if uploaded_file:
                 # 2단계: AI 분석
                 st.write(f"🤖 AI 분석 중 (모델: {model})...")
                 records = analyze_pdf_text(extracted, columns, model)
+
+                # 3단계: 웹 검색 보완 (옵션)
+                if web_enrich:
+                    progress_text = st.empty()
+                    progress_bar = st.progress(0)
+                    total = len(records)
+
+                    def update_progress(cur, tot, msg):
+                        progress_text.write(f"🌐 {msg}")
+                        progress_bar.progress(cur / tot)
+
+                    st.write("🌐 웹 검색으로 빈 필드 보완 중...")
+                    records = enrich_records(records, columns, model, progress_callback=update_progress)
+                    progress_text.empty()
+                    progress_bar.empty()
 
                 status.update(
                     label=f"✅ 완료! {len(records)}개 제품 추출",
