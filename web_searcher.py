@@ -73,40 +73,43 @@ def _fetch_text(url: str) -> str:
         return ""
 
 
-def _search_vendor_direct(cat_no: str) -> str:
-    """Cat.No.로 제조사 URL 직접 시도"""
+def _search_vendor_direct(cat_no: str) -> tuple[str, str]:
+    """Cat.No.로 제조사 URL 직접 시도. (웹텍스트, 사용된URL) 반환"""
     if not cat_no:
-        return ""
+        return "", ""
     cat_clean = cat_no.strip().replace(" ", "")
     for template, _ in VENDOR_URL_TEMPLATES:
         url = template.format(cat=cat_clean, cat_lower=cat_clean.lower())
         text = _fetch_text(url)
-        if len(text) > 200:  # 의미 있는 내용이 있으면 반환
-            return f"[출처: {url}]\n{text}"
+        if len(text) > 200:
+            return f"[출처: {url}]\n{text}", url
         time.sleep(0.3)
-    return ""
+    return "", ""
 
 
-def _search_duckduckgo(query: str) -> str:
-    """DuckDuckGo로 검색 후 상위 결과 크롤링"""
+def _search_duckduckgo(query: str) -> tuple[str, str]:
+    """DuckDuckGo로 검색 후 상위 결과 크롤링. (웹텍스트, 사용된URL) 반환"""
     try:
         from ddgs import DDGS
         results = DDGS().text(query, max_results=3)
         combined = ""
+        first_url = ""
         for r in (results or []):
             url = r.get("href", "")
             body = r.get("body", "")
             if body:
                 combined += f"[출처: {url}]\n{body[:500]}\n"
+                if not first_url:
+                    first_url = url
             page_text = _fetch_text(url)
             if page_text:
                 combined += page_text + "\n"
             if len(combined) > MAX_PAGE_CHARS:
                 break
             time.sleep(SEARCH_DELAY)
-        return combined[:MAX_PAGE_CHARS]
+        return combined[:MAX_PAGE_CHARS], first_url
     except Exception:
-        return ""
+        return "", ""
 
 
 def _fill_with_ai(record: dict, empty_fields: list[str], web_text: str, model: str) -> dict:
@@ -206,14 +209,14 @@ def enrich_records(
             progress_callback(i + 1, total, f"[{i+1}/{total}] {product_name[:30]} 검색 중...")
 
         # 1순위: Cat.No.로 제조사 URL 직접 접근
-        web_text = ""
+        web_text, source_url = "", ""
         if cat_no:
-            web_text = _search_vendor_direct(cat_no)
+            web_text, source_url = _search_vendor_direct(cat_no)
 
         # 2순위: DuckDuckGo 검색
         if not web_text:
             query = f"{product_name} {cat_no} specification datasheet".strip()
-            web_text = _search_duckduckgo(query)
+            web_text, source_url = _search_duckduckgo(query)
 
         # AI로 빈 필드 채우기
         filled = {}
@@ -227,6 +230,12 @@ def enrich_records(
             if field in columns and not new_record.get(field) and value:
                 new_record[field] = value
                 filled_count += 1
+
+        # 비고에 출처 URL 추가 (웹 검색으로 채운 경우)
+        if filled_count > 0 and source_url and "비고" in columns:
+            existing = new_record.get("비고") or ""
+            source_note = f"[웹검색출처] {source_url}"
+            new_record["비고"] = f"{existing} | {source_note}".strip(" |") if existing else source_note
 
         enriched.append(new_record)
 
