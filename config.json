@@ -1,0 +1,26 @@
+{
+  "google_sheets": {
+    "credentials_file": "quote-extractor-490312-f7665c2655f1.json",
+    "sheet_id": "1S-bZy-97OgnGZhQND-ifIBMduhw1tMHMIUsMpCr_KT8",
+    "sheet_name": "Sheet1",
+    "header_row": 1
+  },
+  "columns": [
+    "No.",
+    "주문일자",
+    "입고일자",
+    "대리점",
+    "용도",
+    "제품명",
+    "Cat. No.",
+    "브랜드",
+    "수량",
+    "입고단위",
+    "Lot No.",
+    "보관 온도",
+    "위치",
+    "비고"
+  ],
+  "date_field": true,
+  "ai_model": "gemini-2.5-flash"
+}

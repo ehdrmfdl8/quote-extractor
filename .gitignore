@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 환경 변수 (API 키 등 민감 정보)
+.env
+
+# 구글 서비스 계정 키 (config.json은 포함)
+*-credentials.json
+*-service-account.json
+quote-extractor-*.json
+
+# 출력 파일
+output/
+
+# 입력 데이터 (PDF 샘플 등)
+Data/
